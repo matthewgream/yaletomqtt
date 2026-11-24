@@ -4,6 +4,9 @@ Yale Home locks to MQTT and back, through Yale's cloud: each lock's state (locke
 subscription gets them all at once and then their changes; every operation and door change, with who and how; and requests to lock
 and unlock. Written for a Yale Doorman L3 with its Yale Connect Wi-Fi bridge.
 
+**Status:** the login, the lock's details and the websocket work; lock, unlock and the live events are still to be proven
+against the lock (its Wi-Fi bridge has been offline).
+
 One of a small family of single-purpose *tomqtt bridges (plejdtomqtt, p1metertomqtt, evoaira100sg3tomqtt, ...) that share a
 config convention.
 
