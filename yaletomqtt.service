@@ -1,0 +1,16 @@
+[Unit]
+Description=yaletomqtt - Yale Home locks to MQTT and back
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/yaletomqtt
+ExecStart=/opt/yaletomqtt/.venv/bin/python -u /opt/yaletomqtt/yaletomqtt.py --config /etc/default/yaletomqtt
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
