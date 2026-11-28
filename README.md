@@ -4,8 +4,8 @@ Yale Home locks to MQTT and back, through Yale's cloud: each lock's state (locke
 subscription gets them all at once and then their changes; every operation and door change, with who and how; and requests to lock
 and unlock. Written for a Yale Doorman L3 with its Yale Connect Wi-Fi bridge.
 
-**Status:** proven against the lock (2026-11-28): the login, its state, battery and bridge, lock requests and their events
-(who, how). Unlock is still to be tried.
+**Status:** proven against the lock (2026-11-28): the login, its state, battery and bridge, lock and unlock - from the app
+and as requests here - and their events (who, how).
 
 One of a small family of single-purpose *tomqtt bridges (plejdtomqtt, p1metertomqtt, evoaira100sg3tomqtt, ...) that share a
 config convention.
@@ -48,7 +48,8 @@ Events:
 {"type":"request","ok":false,"error":"…","request":"…","ts":…}                         a request refused or failed
 ```
 
-`method` is `keypad`, `tag`, `remote` (the app from afar, or a request here), `manual`, `autolock` or `mobile` (the app, by
+An operation's `state` is the one it left the lock in (an unlock's is `unlocked`, though the lock may be locked again by the
+time it's published). `method` is `keypad`, `tag`, `remote` (the app from afar, or a request here), `manual`, `autolock` or `mobile` (the app, by
 Bluetooth); `by` is who, when Yale knows.
 
 The push from Yale says what state the lock is in, not who or how: an operation comes from Yale's log a few seconds after

@@ -38,7 +38,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 import aiomqtt
-from yalexs.activity import ActivityType, LockOperationActivity
+from yalexs.activity import ACTIVITY_ACTION_STATES, ActivityType, LockOperationActivity
 from yalexs.authenticator_common import Authentication, AuthenticationState
 from yalexs.const import Brand
 from yalexs.lock import LockDoorStatus, LockOperation, LockStatus
@@ -204,6 +204,17 @@ class YaleData(YaleXSData):
 # -----------------------------------------------------------------------------------------------------------------------------------------
 
 
+STATES = {
+    LockStatus.LOCKED: "locked",
+    LockStatus.UNLOCKED: "unlocked",
+    LockStatus.UNLATCHED: "unlocked",
+    LockStatus.LOCKING: "locking",
+    LockStatus.UNLOCKING: "unlocking",
+    LockStatus.UNLATCHING: "unlocking",
+    LockStatus.JAMMED: "jammed",
+}
+
+
 def method_of(activity):
     if not isinstance(activity, LockOperationActivity):
         return None
@@ -230,7 +241,7 @@ class Bridge:
         self.pending = set()  # lock operations under way
         self.gateway = None
         self.detail_at = {}  # lock id -> when its detail was last read
-        self.emitted = set()  # (lock id, start time) of the operations published
+        self.newest = {}  # lock id -> the start of the newest operation published, or there at start: older ones aren't news
 
     # ---- publishing
 
@@ -270,16 +281,7 @@ class Bridge:
             update_lock_detail_from_activity(detail, bridge)
         if door := self.latest(lock_id, {ActivityType.DOOR_OPERATION}):
             update_lock_detail_from_activity(detail, door)
-        status = detail.lock_status
-        state = {
-            LockStatus.LOCKED: "locked",
-            LockStatus.UNLOCKED: "unlocked",
-            LockStatus.UNLATCHED: "unlocked",
-            LockStatus.LOCKING: "locking",
-            LockStatus.UNLOCKING: "unlocking",
-            LockStatus.UNLATCHING: "unlocking",
-            LockStatus.JAMMED: "jammed",
-        }.get(status, "unknown")
+        state = STATES.get(detail.lock_status, "unknown")
         door = detail.door_state.value if detail.doorsense and isinstance(detail.door_state, LockDoorStatus) else "disabled"
         return {
             "id": lock_id,
@@ -326,20 +328,23 @@ class Bridge:
                 continue
             self.seen[(lock_id, kind)] = started
             if not replay:
+                if kind == "lock":
+                    self.newest[lock_id] = started
                 continue
             if kind == "lock":
                 if activity.was_pushed and method_of(activity) is None:  # the lock's state, pushed: who and how are in Yale's log
                     asyncio.get_running_loop().create_task(self.lookup(lock_id, started, before["state"] if before else None))
-                elif (lock_id, round(started, 3)) not in self.emitted:
+                elif started > self.newest.get(lock_id, 0):
                     self.operation(lock_id, state, activity)
             elif not (activity.was_pushed and before and before["door"] == state["door"]):  # not the same door state again
                 self.event({"type": "door", "lock": state["name"], "id": lock_id, "door": state["door"], "action": activity.action, "ts": int(started)})
 
     def operation(self, lock_id, state, activity):
         started = activity.activity_start_time.timestamp()
-        self.emitted.add((lock_id, round(started, 3)))
+        self.newest[lock_id] = max(self.newest.get(lock_id, 0), started)
         by = activity.operated_by if isinstance(activity, LockOperationActivity) else None
-        self.event({"type": "lock", "lock": state["name"], "id": lock_id, "action": activity.action, "state": state["state"], "by": by, "method": method_of(activity), "ts": int(started)})
+        left = STATES.get(ACTIVITY_ACTION_STATES.get(activity.action), state["state"])  # the state it left, not the one now: it may have moved on
+        self.event({"type": "lock", "lock": state["name"], "id": lock_id, "action": activity.action, "state": left, "by": by, "method": method_of(activity), "ts": int(started)})
 
     # a pushed state, without who or how: the operation behind it from Yale's log (yalexs keeps that only if it's timed after the
     # push), or - none there - the lock reporting its state (its bridge back, say), published only if it isn't the one known
@@ -359,7 +364,7 @@ class Bridge:
         )
         state = self.states.get(lock_id) or self.lock_state(lock_id)
         for activity in operations:
-            if (lock_id, round(activity.activity_start_time.timestamp(), 3)) not in self.emitted:
+            if activity.activity_start_time.timestamp() > self.newest.get(lock_id, 0):
                 self.operation(lock_id, state, activity)
         if not operations and was is not None and was != state["state"]:
             self.event({"type": "state", "lock": state["name"], "id": lock_id, "state": state["state"], "was": was, "ts": int(pushed_at)})
