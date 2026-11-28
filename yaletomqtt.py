@@ -12,8 +12,11 @@
 #   <topic>/locks/<id>   retained, each lock: {"id","name","house_id","model","state":"locked|unlocked|locking|unlocking|jammed|unknown",
 #                        "door":"open|closed|unknown|disabled","battery":0-100,"bridge":"online|offline","ts"}
 #                        - every lock at start: a subscription gets them all, then their changes
-#   <topic>/events       each operation and door change: {"type":"lock","lock","id","action","state","by","method","ts"}
-#                        {"type":"door","lock","id","door","ts"}, and {"type":"request","ok":false,"error"} for a refused request
+#   <topic>/events       each operation: {"type":"lock","lock","id","action","state","by","method","ts"}, from Yale's log (who, how);
+#                        each door change: {"type":"door","lock","id","door","action","ts"};
+#                        a state the lock reported with no operation behind it in Yale's log (its bridge back, a turn while it
+#                        was away): {"type":"state","lock","id","state","was","ts"}; the bridge: {"type":"bridge","lock","id","bridge","ts"};
+#                        and {"type":"request","ok":false,"error"} for a refused request
 #   <topic>/status       retained: online (connected to Yale, push running) / offline
 #   <topic>/request      {"lock":<id or name>,"action":"lock"|"unlock"} ("lock" may be left out when there's only one)
 #
@@ -49,6 +52,9 @@ ACCOUNT_LINK = "account-link.nabucasa.com"  # Nabu Casa's OAuth account linking,
 SERVICE = "yale"
 TOKEN_MARGIN = 120  # refresh this many seconds before the access token expires
 CHECK_INTERVAL = 60  # look for a change nothing signalled
+DETAIL_INTERVAL = 900  # re-read each lock's detail (its bridge, battery) this often - yalexs on its own does it once a day
+LOOKUP_DELAY = 6  # a push that says only what state a lock is in: by then Yale's log has the operation behind it, if there was one
+LOOKUP_WINDOW = 60  # an operation in the log this close to the push is the one behind it
 RECONNECT_MIN, RECONNECT_MAX = 10, 600
 EVENTS_QUEUED = 1000  # events kept while the broker is away
 REQUEST_TIMEOUT = 60  # a lock operation with no answer by then is reported as failed
@@ -189,6 +195,9 @@ class YaleData(YaleXSData):
     def async_offline_key_discovered(self, detail):
         log(f"yale: {detail.device_name}: an offline key is available (slot {detail.offline_slot}) - for a local, Bluetooth route")
 
+    async def refresh_detail(self, lock_id):  # yalexs's own refresh, which keeps the pushed lock and door state; it runs it only daily
+        await self._async_refresh_device_detail_by_id(lock_id)
+
 
 # -----------------------------------------------------------------------------------------------------------------------------------------
 # the locks: state as Home Assistant's lock and door sensor make it, from each lock's detail and its latest activities
@@ -207,7 +216,7 @@ def method_of(activity):
     ):
         if flag:
             return method
-    return "mobile"
+    return "mobile" if activity.operated_by else None  # neither who nor how: a push of the lock's state, not an operation
 
 
 class Bridge:
@@ -219,6 +228,9 @@ class Bridge:
         self.events = asyncio.Queue(maxsize=EVENTS_QUEUED)
         self.mqtt = None  # the connected client, if any
         self.pending = set()  # lock operations under way
+        self.gateway = None
+        self.detail_at = {}  # lock id -> when its detail was last read
+        self.emitted = set()  # (lock id, start time) of the operations published
 
     # ---- publishing
 
@@ -253,7 +265,8 @@ class Bridge:
         without_operator = self.latest(lock_id, {ActivityType.LOCK_OPERATION_WITHOUT_OPERATOR})
         if latest := get_latest_activity(without_operator, lock_activity):
             update_lock_detail_from_activity(detail, latest)
-        if bridge := self.latest(lock_id, {ActivityType.BRIDGE_OPERATION}):
+        # a bridge activity has no time check of its own in yalexs: an old one would undo a fresh read of the detail
+        if (bridge := self.latest(lock_id, {ActivityType.BRIDGE_OPERATION})) and bridge.activity_start_time.timestamp() > self.detail_at.get(lock_id, 0):
             update_lock_detail_from_activity(detail, bridge)
         if door := self.latest(lock_id, {ActivityType.DOOR_OPERATION}):
             update_lock_detail_from_activity(detail, door)
@@ -287,10 +300,20 @@ class Bridge:
             await self.publish(f"locks/{lock_id}", {**state, "ts": now()}, retain=True)
             if before and DEBUG:
                 log(f"state: {state['name']}: {state['state']}, door {state['door']}")
-        self.activities(lock_id, state)
+        if before and state["bridge"] is not None and before.get("bridge") != state["bridge"]:
+            log(f"yale: {state['name']}: its bridge is {state['bridge']}")
+            self.event({"type": "bridge", "lock": state["name"], "id": lock_id, "bridge": state["bridge"]})
+        self.activities(lock_id, state, before)
+
+    async def refresh(self, lock_id):
+        self.detail_at[lock_id] = time.time()
+        try:
+            await self.data.refresh_detail(lock_id)
+        except Exception as e:  # noqa: BLE001 - the next one may do
+            log(f"yale: reading {lock_id}: {type(e).__name__}: {e}")
 
     # new activities since the last look: events (who, how) - at start just remembered, not replayed
-    def activities(self, lock_id, state, replay=True):
+    def activities(self, lock_id, state, before=None, replay=True):
         for kind, types in (
             ("lock", {ActivityType.LOCK_OPERATION, ActivityType.LOCK_OPERATION_WITHOUT_OPERATOR}),
             ("door", {ActivityType.DOOR_OPERATION}),
@@ -305,15 +328,48 @@ class Bridge:
             if not replay:
                 continue
             if kind == "lock":
-                by = activity.operated_by if isinstance(activity, LockOperationActivity) else None
-                self.event(
-                    {"type": "lock", "lock": state["name"], "id": lock_id, "action": activity.action, "state": state["state"], "by": by, "method": method_of(activity), "ts": int(started)}
-                )
-            else:
+                if activity.was_pushed and method_of(activity) is None:  # the lock's state, pushed: who and how are in Yale's log
+                    asyncio.get_running_loop().create_task(self.lookup(lock_id, started, before["state"] if before else None))
+                elif (lock_id, round(started, 3)) not in self.emitted:
+                    self.operation(lock_id, state, activity)
+            elif not (activity.was_pushed and before and before["door"] == state["door"]):  # not the same door state again
                 self.event({"type": "door", "lock": state["name"], "id": lock_id, "door": state["door"], "action": activity.action, "ts": int(started)})
 
+    def operation(self, lock_id, state, activity):
+        started = activity.activity_start_time.timestamp()
+        self.emitted.add((lock_id, round(started, 3)))
+        by = activity.operated_by if isinstance(activity, LockOperationActivity) else None
+        self.event({"type": "lock", "lock": state["name"], "id": lock_id, "action": activity.action, "state": state["state"], "by": by, "method": method_of(activity), "ts": int(started)})
+
+    # a pushed state, without who or how: the operation behind it from Yale's log (yalexs keeps that only if it's timed after the
+    # push), or - none there - the lock reporting its state (its bridge back, say), published only if it isn't the one known
+    async def lookup(self, lock_id, pushed_at, was):
+        await asyncio.sleep(LOOKUP_DELAY)
+        if self.data is None:
+            return
+        try:
+            token = await self.gateway.async_get_access_token()
+            found = await self.gateway.api.async_get_house_activities(token, self.data.get_device_detail(lock_id).house_id, limit=10)
+        except Exception as e:  # noqa: BLE001 - then it's reported as a state
+            log(f"yale: looking up the operation behind a pushed state: {type(e).__name__}: {e}")
+            found = []
+        operations = sorted(
+            (a for a in found if isinstance(a, LockOperationActivity) and a.device_id == lock_id and abs(a.activity_start_time.timestamp() - pushed_at) <= LOOKUP_WINDOW),
+            key=lambda a: a.activity_start_time,
+        )
+        state = self.states.get(lock_id) or self.lock_state(lock_id)
+        for activity in operations:
+            if (lock_id, round(activity.activity_start_time.timestamp(), 3)) not in self.emitted:
+                self.operation(lock_id, state, activity)
+        if not operations and was is not None and was != state["state"]:
+            self.event({"type": "state", "lock": state["name"], "id": lock_id, "state": state["state"], "was": was, "ts": int(pushed_at)})
+
     def changed(self, lock_id):
-        asyncio.get_running_loop().create_task(self.update(lock_id))
+        loop = asyncio.get_running_loop()
+        state = self.states.get(lock_id)
+        if state and state["bridge"] == "offline" and time.time() - self.detail_at.get(lock_id, 0) > CHECK_INTERVAL:
+            loop.create_task(self.refresh(lock_id))  # word from a lock whose bridge reads offline: it may be back
+        loop.create_task(self.update(lock_id))
 
     # ---- requests: {"lock": id or name, "action": "lock"|"unlock"}
 
@@ -376,9 +432,12 @@ class Bridge:
         gateway = TokenGateway(state_dir, session, tokens)
         await gateway.async_setup({CONF_BRAND: Brand.YALE_GLOBAL})
         await gateway.async_authenticate()
+        self.gateway = gateway
         self.data = YaleData(gateway)
         await self.data.async_setup()
         locks = list(self.data.locks)
+        for lock in locks:
+            self.detail_at[lock.device_id] = time.time()  # the setup has just read them
         log(f"yale: connected, {len(locks)} lock(s): {', '.join(f'{x.device_name} [{x.device_id}]' for x in locks)}")
         for lock in locks:
             self.data.async_subscribe_device_id(lock.device_id, lambda lock_id=lock.device_id: self.changed(lock_id))
@@ -397,6 +456,8 @@ class Bridge:
                 push_was = self.data.push_updates_connected
                 log(f"yale: push updates {'connected' if push_was else 'not connected (polling)'}")
             for lock in list(self.data.locks):
+                if time.time() - self.detail_at.get(lock.device_id, 0) >= DETAIL_INTERVAL:
+                    await self.refresh(lock.device_id)
                 await self.update(lock.device_id)
 
     async def yale_forever(self):

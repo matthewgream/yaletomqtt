@@ -4,8 +4,8 @@ Yale Home locks to MQTT and back, through Yale's cloud: each lock's state (locke
 subscription gets them all at once and then their changes; every operation and door change, with who and how; and requests to lock
 and unlock. Written for a Yale Doorman L3 with its Yale Connect Wi-Fi bridge.
 
-**Status:** the login, the lock's details and the websocket work; lock, unlock and the live events are still to be proven
-against the lock (its Wi-Fi bridge has been offline).
+**Status:** proven against the lock (2026-11-28): the login, its state, battery and bridge, lock requests and their events
+(who, how). Unlock is still to be tried.
 
 One of a small family of single-purpose *tomqtt bridges (plejdtomqtt, p1metertomqtt, evoaira100sg3tomqtt, ...) that share a
 config convention.
@@ -41,12 +41,20 @@ Not affiliated with Yale.
 Events:
 
 ```
-{"type":"lock","lock":"FRONT DOOR","id":"…","action":"unlock","state":"unlocked","by":"…","method":"keypad","ts":…}
+{"type":"lock","lock":"FRONT DOOR","id":"…","action":"remote_lock","state":"locked","by":"…","method":"remote","ts":…}
 {"type":"door","lock":"FRONT DOOR","id":"…","door":"open","action":"dooropen","ts":…}
+{"type":"state","lock":"FRONT DOOR","id":"…","state":"locked","was":"unknown","ts":…}   the lock reported a new state, no operation behind it
+{"type":"bridge","lock":"FRONT DOOR","id":"…","bridge":"online","ts":…}                its Wi-Fi bridge came or went
 {"type":"request","ok":false,"error":"…","request":"…","ts":…}                         a request refused or failed
 ```
 
-`method` is `keypad`, `tag`, `remote` (the app, or a request here), `manual`, `autolock` or `mobile`; `by` is who, when Yale knows.
+`method` is `keypad`, `tag`, `remote` (the app from afar, or a request here), `manual`, `autolock` or `mobile` (the app, by
+Bluetooth); `by` is who, when Yale knows.
+
+The push from Yale says what state the lock is in, not who or how: an operation comes from Yale's log a few seconds after
+(so its event is that late). A push with no operation in the log behind it - the bridge back after a while, reporting the state
+it's in - is a `state` event, and only if the state isn't the one already known. The lock's detail (its bridge, battery) is
+read every 15 minutes, and at once when a lock whose bridge reads offline is heard from.
 
 Requests — the lock by id or name, or left out when there's only one:
 
